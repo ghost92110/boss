@@ -1,0 +1,64 @@
+//@version=5
+indicator("Ichimoku Cloud", shorttitle="Ichimoku", overlay=true)
+
+// Input parameters
+tenkanPeriod = input.int(9, minval=1, title="Tenkan-sen Period")
+kijunPeriod = input.int(26, minval=1, title="Kijun-sen Period")
+senkouSpanBPeriod = input.int(52, minval=1, title="Senkou Span B Period")
+displacement = input.int(26, minval=1, title="Displacement")
+
+// Color inputs
+tenkanColor = input.color(color.red, title="Tenkan-sen Color")
+kijunColor = input.color(color.blue, title="Kijun-sen Color")
+senkouSpanAColor = input.color(color.green, title="Senkou Span A Color")
+senkouSpanBColor = input.color(color.red, title="Senkou Span B Color")
+chikouColor = input.color(color.purple, title="Chikou Span Color")
+
+// Helper function: Donchian channel (highest high + lowest low) / 2
+donchian(len) =>
+    (ta.highest(high, len) + ta.lowest(low, len)) / 2
+
+// Calculate Ichimoku components
+// Tenkan-sen (Conversion Line): (9-period high + 9-period low)/2
+tenkanSen = donchian(tenkanPeriod)
+
+// Kijun-sen (Base Line): (26-period high + 26-period low)/2
+kijunSen = donchian(kijunPeriod)
+
+// Senkou Span A (Leading Span A): (Tenkan-sen + Kijun-sen)/2 plotted 26 periods ahead
+senkouSpanA = (tenkanSen + kijunSen) / 2
+
+// Senkou Span B (Leading Span B): (52-period high + 52-period low)/2 plotted 26 periods ahead
+senkouSpanB = donchian(senkouSpanBPeriod)
+
+// Chikou Span (Lagging Span): Current closing price plotted 26 periods back
+chikouSpan = close
+
+// Plot the lines
+plot(tenkanSen, color=tenkanColor, title="Tenkan-sen", linewidth=2)
+plot(kijunSen, color=kijunColor, title="Kijun-sen", linewidth=2)
+
+// Plot Senkou Span A and B with displacement
+p1 = plot(senkouSpanA, offset=displacement, color=senkouSpanAColor, title="Senkou Span A", linewidth=1)
+p2 = plot(senkouSpanB, offset=displacement, color=senkouSpanBColor, title="Senkou Span B", linewidth=1)
+
+// Fill the cloud (Kumo) - green when bullish, red when bearish
+fill(p1, p2, color=senkouSpanA > senkouSpanB ? color.new(color.green, 90) : color.new(color.red, 90), title="Kumo (Cloud)")
+
+// Plot Chikou Span with negative offset
+plot(chikouSpan, offset=-displacement, color=chikouColor, title="Chikou Span", linewidth=1)
+
+// Optional: Add buy/sell signals
+// Buy signal: Price crosses above cloud and Tenkan crosses above Kijun
+buySignal = ta.crossover(tenkanSen, kijunSen) and close > senkouSpanA[displacement] and close > senkouSpanB[displacement]
+
+// Sell signal: Price crosses below cloud and Tenkan crosses below Kijun
+sellSignal = ta.crossunder(tenkanSen, kijunSen) and close < senkouSpanA[displacement] and close < senkouSpanB[displacement]
+
+// Plot signals
+plotshape(buySignal, title="Buy Signal", location=location.belowbar, color=color.green, style=shape.labelup, text="BUY", textcolor=color.white, size=size.small)
+plotshape(sellSignal, title="Sell Signal", location=location.abovebar, color=color.red, style=shape.labeldown, text="SELL", textcolor=color.white, size=size.small)
+
+// Optional: Add alerts
+alertcondition(buySignal, title="Ichimoku Buy", message="Ichimoku Buy Signal!")
+alertcondition(sellSignal, title="Ichimoku Sell", message="Ichimoku Sell Signal!")
