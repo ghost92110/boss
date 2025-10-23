@@ -49,11 +49,23 @@ fill(p1, p2, color=senkouSpanA > senkouSpanB ? color.new(color.green, 90) : colo
 plot(chikouSpan, offset=-displacement, color=chikouColor, title="Chikou Span", linewidth=1)
 
 // Optional: Add buy/sell signals
-// Buy signal: Price crosses above cloud and Tenkan crosses above Kijun
-buySignal = ta.crossover(tenkanSen, kijunSen) and close > senkouSpanA[displacement] and close > senkouSpanB[displacement]
+// Conditions for buy and sell
+buyCondition = ta.crossover(tenkanSen, kijunSen) and close > senkouSpanA[displacement] and close > senkouSpanB[displacement]
+sellCondition = ta.crossunder(tenkanSen, kijunSen) and close < senkouSpanA[displacement] and close < senkouSpanB[displacement]
 
-// Sell signal: Price crosses below cloud and Tenkan crosses below Kijun
-sellSignal = ta.crossunder(tenkanSen, kijunSen) and close < senkouSpanA[displacement] and close < senkouSpanB[displacement]
+// Track signal state to avoid repetition
+// 1 = Long position, -1 = Short position, 0 = Neutral
+var int signalState = 0
+
+// Update signal state
+if buyCondition and signalState != 1
+    signalState := 1
+else if sellCondition and signalState != -1
+    signalState := -1
+
+// Only show signal when state changes
+buySignal = buyCondition and signalState[1] != 1
+sellSignal = sellCondition and signalState[1] != -1
 
 // Plot signals
 plotshape(buySignal, title="Buy Signal", location=location.belowbar, color=color.green, style=shape.labelup, text="BUY", textcolor=color.white, size=size.small)
