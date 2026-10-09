@@ -82,6 +82,34 @@ f_lo(array<float> a, int from) =>
                 mi := i
     [m, mi]
 
+// Cibles après un flip (modèle 3) : structure H4 externe opposée = dernier pivot H4 au-delà de `ref`
+// jamais dépassé depuis ; renvoie [0.71 du range opposé qui part de ce pivot, ce pivot].
+// g = 1 cherche vers le haut (achat), g = -1 vers le bas (vente).
+f_opp(array<float> aH, array<float> aL, int p, float ref, float g, float lvl) =>
+    float z = na
+    float x = na
+    int n = aH.size()
+    float runMax = na
+    float runMin = na
+    int i = n - 1
+    while i >= p and na(x)
+        float v = g == 1 ? aH.get(i) : -aL.get(i)
+        float w = g == 1 ? aL.get(i) : -aH.get(i)
+        if i <= n - 1 - p and v > g * ref and (na(runMax) or v > runMax)
+            bool piv = true
+            for j = i - p to i - 1
+                float u = g == 1 ? aH.get(j) : -aL.get(j)
+                if u >= v
+                    piv := false
+            if piv
+                float lo = na(runMin) ? w : math.min(w, runMin)
+                x := v
+                z := lo + lvl * (v - lo)
+        runMax := na(runMax) ? v : math.max(runMax, v)
+        runMin := na(runMin) ? w : math.min(runMin, w)
+        i -= 1
+    [g * z, g * x]
+
 fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float lvl, float ext, float tolK, bool needOB, bool needFVG, string sess, string tz) =>
     float tick = syminfo.mintick
     float atr = ta.atr(14)
@@ -160,6 +188,8 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
     var bool everTouched = false
     var bool freshFlip = false
     var bool originProt = false
+    var float oppZ = na
+    var float oppX = na
     var int setupsDone = 0
     var float brkLvl = na
     var int brkT = na
@@ -225,6 +255,8 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
     var float slP = na
     var float t1P = na
     var float t2P = na
+    var float t2Pl = na
+    var float tS = 1.0
     var bool t1Hit = false
     var float asH = na
     var float asL = na
@@ -327,6 +359,9 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
             originProt := not na(lastLoSwT) and lastLoSwT >= r1T - htfMs and lastLoSwT <= r1T + htfMs
             p1 := originProt ? r1 : na
             p1T := r1T
+            [oz, ox] = f_opp(aH, aL, pH, r0, 1.0, lvl)
+            oppZ := oz
+            oppX := ox
             ev += 512
         else if trend == 1 and not na(r1) and c < r1
             // Flip baissier : le fib haussier est cassé
@@ -345,6 +380,9 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
             originProt := not na(lastHiSwT) and lastHiSwT >= r1T - htfMs and lastHiSwT <= r1T + htfMs
             p1 := originProt ? r1 : na
             p1T := r1T
+            [oz, ox] = f_opp(aH, aL, pH, r0, -1.0, lvl)
+            oppZ := oz
+            oppX := ox
             ev += 512
         else if trend <= 0 and plArmed and c < aPL
             // Cassure baissière (continuation ou première tendance)
@@ -446,8 +484,12 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
     float asT = s == 1 ? asH : -asL
     bool ctx = trend != 0 and (zoneNow or everTouched)
     bool skip = false
+    // Cible après un flip : prochain 0.71 H4 opposé, sinon structure externe opposée (au-delà du 0 H4)
+    float tgt3 = not na(oppZ) and s * oppZ < s * r0 ? oppZ : not na(oppX) and s * oppX < s * r0 ? oppX : na
 
-    if trendChanged
+    // Un changement de tendance annule une séquence en cours, mais pas une position ouverte :
+    // celle-ci reste gérée jusqu'à son SL ou son TP (sinon elle disparaîtrait des statistiques).
+    if trendChanged and st != 3
         if st > 0
             ev += 256
             cR := 3
@@ -458,10 +500,15 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
     if st == 0 and freshFlip and originProt and zoneHit and not trendChanged
         model := 3
         m3Direct := true
+        tS := s
         eP := s * z71r
         slP := s * r1
-        t1P := s * r0
-        t2P := s * r0 - ext * (s * r1 - s * r0)
+        if na(tgt3)
+            t1P := s * r0
+            t2P := s * r0 - ext * (s * r1 - s * r0)
+        else
+            t1P := s * tgt3
+            t2P := tgt3 == oppZ and not na(oppX) and s * oppX < s * oppZ ? s * oppX : na
         t1Hit := false
         freshFlip := false
         st := 3
@@ -548,10 +595,11 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
                 ev += 256
             else if bar_index > mssBar and H >= eCur
                 if ready
+                    tS := s
                     eP := eCur
                     slP := sExt
                     t1P := f0 - ext * (sExt - f0)
-                    float h4t = s * r0
+                    float h4t = s * (model == 3 and not na(tgt3) ? tgt3 : r0)
                     t2P := h4t < t1P ? h4t : na
                     t1Hit := false
                     freshFlip := false
@@ -580,21 +628,23 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
                 cR := 1
                 ev += 256
         else if st == 3
-            if H >= slP
+            // Gestion dans le sens du trade (tS), qui peut différer de la tendance après un flip
+            float tH = tS == 1 ? high : -low
+            float tL = tS == 1 ? low : -high
+            if tH >= slP
                 st := 0
-                setupsDone += 1
                 ev += 128
             else
-                if not t1Hit and L <= t1P
+                if not t1Hit and tL <= t1P
                     t1Hit := true
                     ev += 32
                     if na(t2P)
                         st := 0
-                        setupsDone += 1
-                if st == 3 and not na(t2P) and L <= t2P
+                if st == 3 and not na(t2P) and tL <= t2P
                     st := 0
-                    setupsDone += 1
                     ev += 64
+            if st == 0 and tS == s
+                setupsDone += 1
 
     // Trades fantômes : setups refusés au 0.71 pour confluence incomplète, suivis jusqu'au TP1 ou au SL
     int gEv = 0
@@ -660,6 +710,10 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
         cOB := not na(obHi) and eCur <= obHi + tol and eCur >= obLo - tol
         cFV := not na(fvHi) and eCur <= fvHi + tol and eCur >= fvLo - tol
         bool allOk = cDisp and (cOB or not needOB) and (cFV or not needFVG)
+        // TP2 prévu (même règle qu'à l'entrée), pour l'alerte « setup complet »
+        float t1x = f0 - ext * (sExt - f0)
+        float h4x = s * (model == 3 and not na(tgt3) ? tgt3 : r0)
+        t2Pl := h4x < t1x ? h4x : na
         if allOk and not readySent
             readySent := true
             ev += 8
@@ -679,13 +733,13 @@ fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float
     int cnt = (trend != 0 ? 1 : 0) + (zoneNow or everTouched ? 1 : 0) + (seq and st >= 1 ? 1 : 0) + (seq and st >= 1 and cDisp ? 1 : 0) + (seq and st >= 2 ? 1 : 0) + (seq and st >= 2 and cOB ? 1 : 0) + (seq and st >= 2 and cFV ? 1 : 0) + (seq and st >= 1 and cAsia ? 1 : 0)
     int score = math.round(cnt * 100.0 / 8.0)
 
-    [trend, r1, r1T, r0, r0T, p1, p1T, z71r, z71p, zoneNow, everTouched, model, st, score, ev, cDisp, cOB, cFV, cAsia, s * swLvl, swLvlT, s * sExt, sExtT, s * mssLvl, mssT0, s * f0, s * eCur, s * obLo, s * obHi, obT, s * fvLo, s * fvHi, fvT, s * eP, s * slP, s * t1P, s * t2P, brkLvl, brkT, m3Direct, ready, cR, cM, gEv, gMk, gY, gW, gL]
+    [trend, r1, r1T, r0, r0T, p1, p1T, z71r, z71p, zoneNow, everTouched, model, st, score, ev, cDisp, cOB, cFV, cAsia, s * swLvl, swLvlT, s * sExt, sExtT, s * mssLvl, mssT0, s * f0, s * eCur, s * obLo, s * obHi, obT, s * fvLo, s * fvHi, fvT, tS * eP, tS * slP, tS * t1P, tS * t2P, brkLvl, brkT, m3Direct, ready, cR, cM, gEv, gMk, gY, gW, gL, s * t2Pl, tS]
 // ═══ FIN DU MOTEUR ═══════════════════════════════════════════════════════════
 
 // ═════════════════════════════════════════════════════════════════════════════
 // AFFICHAGE
 // ═════════════════════════════════════════════════════════════════════════════
-[trend, r1, r1T, r0, r0T, p1, p1T, z71r, z71p, zoneNow, everTouched, model, st, score, ev, cDisp, cOB, cFV, cAsia, swLvl, swLvlT, sExt, sExtT, mssLvl, mssT0, f0, eCur, obLo, obHi, obT, fvLo, fvHi, fvT, eP, slP, t1P, t2P, brkLvl, brkT, m3Direct, ready, cR, cM, gEv, gMk, gY, gW, gL] = fmes(i_htf, i_pH, i_pL, i_disp, i_wait1, i_wait2, i_lvl, i_ext, i_tol, i_needOB, i_needFVG, i_sess, i_tz)
+[trend, r1, r1T, r0, r0T, p1, p1T, z71r, z71p, zoneNow, everTouched, model, st, score, ev, cDisp, cOB, cFV, cAsia, swLvl, swLvlT, sExt, sExtT, mssLvl, mssT0, f0, eCur, obLo, obHi, obT, fvLo, fvHi, fvT, eP, slP, t1P, t2P, brkLvl, brkT, m3Direct, ready, cR, cM, gEv, gMk, gY, gW, gL, t2Plan, tSide] = fmes(i_htf, i_pH, i_pL, i_disp, i_wait1, i_wait2, i_lvl, i_ext, i_tol, i_needOB, i_needFVG, i_sess, i_tz)
 
 f_bit(int e, int k) =>
     int(e / k) % 2 == 1
@@ -922,25 +976,44 @@ if eEntry
     hasFib := false
 var bool gotTP1 = false
 var bool trk = false
+var bool trkM3 = false
 var int nWin = 0
 var int nLoss = 0
+var float rSum = 0.0
+var int nWin3 = 0
+var int nLoss3 = 0
+var float rSum3 = 0.0
+// Sens du trade en cours (peut différer de la tendance H4 si un flip survient en position)
+bool tSell = tSide == 1
 f_res(float y, string txt, color bg, bool above) =>
     label.new(time, y, txt, xloc = xloc.bar_time, style = above ? label.style_label_down : label.style_label_up, color = bg, textcolor = color.white, size = SZ)
 if eEntry
     gotTP1 := false
-    trk := not m3Direct
+    trk := true
+    trkM3 := m3Direct
 if eTP1
     gotTP1 := true
     if trk
-        nWin += 1
+        float rr = math.abs(t1P - eP) / math.abs(slP - eP)
+        if trkM3
+            nWin3 += 1
+            rSum3 += rr
+        else
+            nWin += 1
+            rSum += rr
         trk := false
-    f_res(t1P, na(t2P) ? "WIN" : "WIN · TP1", #1D9E75, not isSell)
+    f_res(t1P, na(t2P) ? "WIN" : "WIN · TP1", #1D9E75, not tSell)
 if eTP2
-    f_res(t2P, "WIN · TP2", #1D9E75, not isSell)
+    f_res(t2P, "WIN · TP2", #1D9E75, not tSell)
 if eSL
-    f_res(slP, gotTP1 ? "SL after TP1" : "LOSS", gotTP1 ? #888780 : #E24B4A, isSell)
+    f_res(slP, gotTP1 ? "SL after TP1" : "LOSS", gotTP1 ? #888780 : #E24B4A, tSell)
     if trk
-        nLoss += 1
+        if trkM3
+            nLoss3 += 1
+            rSum3 -= 1
+        else
+            nLoss += 1
+            rSum -= 1
         trk := false
 if i_showGhost and gEv > 0
     bool gWin = gEv == 1
@@ -953,7 +1026,7 @@ string POS = switch i_posS
     "Bas droite" => position.bottom_right
     "Bas gauche" => position.bottom_left
     => position.top_right
-var table tb = table.new(POS, 2, 18, bgcolor = color.new(chart.bg_color, 10), border_color = color.new(i_cTxt, 70), border_width = 1, frame_color = color.new(i_cTxt, 50), frame_width = 1)
+var table tb = table.new(POS, 2, 19, bgcolor = color.new(chart.bg_color, 10), border_color = color.new(i_cTxt, 70), border_width = 1, frame_color = color.new(i_cTxt, 50), frame_width = 1)
 
 f_row(int r, string name, bool ok, bool known) =>
     color cG = #1D9E75
@@ -961,11 +1034,12 @@ f_row(int r, string name, bool ok, bool known) =>
     tb.cell(0, r, name, text_color = chart.fg_color, text_halign = text.align_left, text_size = SZ)
     tb.cell(1, r, known ? (ok ? "✔" : "✘") : "–", text_color = known ? (ok ? cG : cR) : i_cTxt, text_size = SZ)
 
-f_stat(int r, string name, int w, int l) =>
+// rs : somme des R réalisés (trades pris) ; na pour les fantômes, dont le gain au TP1 est fixe
+f_stat(int r, string name, int w, int l, float rs) =>
     int n = w + l
     float rw = (i_lvl + i_ext) / (1 - i_lvl)
     float wr = n > 0 ? 1.0 * w / n : 0.0
-    float er = wr * rw - (1 - wr)
+    float er = not na(rs) ? (n > 0 ? rs / n : 0.0) : wr * rw - (1 - wr)
     string v = n == 0 ? "–" : str.tostring(n) + " · " + str.tostring(math.round(wr * 100)) + " % · " + (er > 0 ? "+" : "") + str.tostring(er, "#.##") + "R"
     tb.cell(0, r, name, text_color = chart.fg_color, text_halign = text.align_left, text_size = SZ)
     tb.cell(1, r, v, text_color = n == 0 ? i_cTxt : er > 0 ? #1D9E75 : #E24B4A, text_size = SZ)
@@ -1002,11 +1076,12 @@ if barstate.islast
     if i_showStats
         tb.cell(0, 12, "Stats · trades · réussite TP1 · R moyen", text_color = i_cTxt, text_halign = text.align_left, text_size = SZ)
         tb.merge_cells(0, 12, 1, 12)
-        f_stat(13, "Pris", nWin, nLoss)
-        f_stat(14, "Refusé : displacement", gW % 1000, gL % 1000)
-        f_stat(15, "Refusé : order block", int(gW / 1000) % 1000, int(gL / 1000) % 1000)
-        f_stat(16, "Refusé : volume gap", int(gW / 1000000) % 1000, int(gL / 1000000) % 1000)
-        f_stat(17, "Refusé : plusieurs", int(gW / 1000000000), int(gL / 1000000000))
+        f_stat(13, "Pris : séquence complète", nWin, nLoss, rSum)
+        f_stat(14, "Pris : limite directe (modèle 3)", nWin3, nLoss3, rSum3)
+        f_stat(15, "Refusé : displacement", gW % 1000, gL % 1000, na)
+        f_stat(16, "Refusé : order block", int(gW / 1000) % 1000, int(gL / 1000) % 1000, na)
+        f_stat(17, "Refusé : volume gap", int(gW / 1000000) % 1000, int(gL / 1000000) % 1000, na)
+        f_stat(18, "Refusé : plusieurs", int(gW / 1000000000), int(gL / 1000000000), na)
 
 // ── Alertes (créer une alerte « Any alert() function call » sur l'indicateur)
 string side = isSell ? "sell" : "buy"
@@ -1016,7 +1091,7 @@ f_p(float x) =>
 if i_aZone and eZone
     alert(base + ',"event":"h4_zone","level":' + f_p(z71r) + '}', alert.freq_once_per_bar_close)
 if i_aReady and eReady
-    alert(base + ',"event":"setup_ready","entry":' + f_p(eCur) + ',"sl":' + f_p(sExt) + ',"tp1":' + f_p(f0 - i_ext * (sExt - f0)) + ',"tp2":' + f_p(r0) + '}', alert.freq_once_per_bar_close)
+    alert(base + ',"event":"setup_ready","entry":' + f_p(eCur) + ',"sl":' + f_p(sExt) + ',"tp1":' + f_p(f0 - i_ext * (sExt - f0)) + ',"tp2":' + (na(t2Plan) ? "null" : f_p(t2Plan)) + '}', alert.freq_once_per_bar_close)
 if i_aEntry and eEntry
     alert(base + ',"event":"entry","entry":' + f_p(eP) + ',"sl":' + f_p(slP) + ',"tp1":' + f_p(t1P) + ',"tp2":' + (na(t2P) ? "null" : f_p(t2P)) + '}', alert.freq_once_per_bar_close)
 if i_aCancel and eCancel
