@@ -1,0 +1,1023 @@
+//@version=6
+// FMES Indicator — contexte H4 + exécution 15m (sweep, mss, fib 0.71, order block, volume gap)
+// À poser sur un graphique 15m. Validation à la clôture de bougie (pas de repaint).
+indicator("FMES Indicator", "FMES", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 300, calc_bars_count = 10000)
+
+string G1 = "Contexte"
+string i_htf = input.timeframe("240", "Unité de temps du contexte", group = G1)
+int i_pH = input.int(3, "Longueur des pivots H4", minval = 1, maxval = 10, group = G1)
+float i_lvl = input.float(0.71, "Niveau d'entrée du fib", minval = 0.5, maxval = 0.9, step = 0.01, group = G1)
+float i_ext = input.float(0.27, "Extension TP1 (-0.27)", minval = 0.0, step = 0.01, group = G1)
+
+string G2 = "Exécution"
+int i_pL = input.int(3, "Longueur des pivots 15m (liquidité)", minval = 1, maxval = 10, group = G2)
+float i_disp = input.float(1.2, "Displacement : corps minimal (× ATR)", minval = 0.1, step = 0.1, group = G2)
+int i_wait1 = input.int(16, "Délai max sweep → mss (bougies)", minval = 1, group = G2)
+int i_wait2 = input.int(48, "Délai max mss → retour au 0.71 (bougies)", minval = 1, group = G2)
+float i_tol = input.float(0.15, "Tolérance de confluence (× ATR)", minval = 0.0, step = 0.05, group = G2)
+bool i_needOB = input.bool(true, "Order block obligatoire", group = G2)
+bool i_needFVG = input.bool(true, "Volume gap obligatoire", group = G2)
+
+string G3 = "Session Asie"
+string i_sess = input.session("1900-0000", "Horaires", group = G3)
+string i_tz = input.string("America/New_York", "Fuseau horaire", group = G3)
+bool i_showAsia = input.bool(true, "Afficher la boîte Asie", group = G3)
+
+string G4 = "Affichage"
+bool i_onlyCur = input.bool(false, "Afficher seulement le setup en cours", group = G4)
+bool i_showCtx = input.bool(true, "Afficher le contexte H4", group = G4)
+bool i_showGhost = input.bool(true, "Afficher les trades fantômes (setups refusés)", group = G4)
+bool i_showStats = input.bool(true, "Afficher les statistiques dans le tableau", group = G4)
+bool i_recolor = input.bool(false, "Recolorer les bougies (orange / gris)", group = G4)
+int i_extBars = input.int(12, "Prolongement des niveaux à droite (bougies)", minval = 1, group = G4)
+int i_boxBars = input.int(24, "Largeur des boîtes risque / gain (bougies)", minval = 2, group = G4)
+string i_sizeS = input.string("Petit", "Taille du texte", options = ["Très petit", "Petit", "Normal"], group = G4)
+string i_posS = input.string("Haut droite", "Position du tableau", options = ["Haut droite", "Haut gauche", "Bas droite", "Bas gauche"], group = G4)
+color i_cTxt = input.color(#787b86, "Texte et lignes", group = G4)
+color i_cLast = input.color(#378ADD, "Last recent high / low", group = G4)
+color i_cProt = input.color(#7F77DD, "Protected high / low", group = G4)
+color i_cOB = input.color(#EF9F27, "Order block", group = G4)
+color i_cFVG = input.color(#E24B4A, "Volume gap", group = G4)
+color i_cAsia = input.color(#AFA9EC, "Session Asie", group = G4)
+
+string G5 = "Alertes"
+bool i_aZone = input.bool(true, "Zone H4 atteinte", group = G5)
+bool i_aReady = input.bool(true, "Setup complet", group = G5)
+bool i_aEntry = input.bool(true, "Entrée touchée", group = G5)
+bool i_aCancel = input.bool(false, "Setup annulé", group = G5)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MOTEUR FMES (identique dans l'indicateur et dans le screener)
+// - Reconstruit les bougies du contexte (H4) à partir des bougies du graphique.
+// - Aucune fonction de dessin ici : le moteur renvoie seulement des valeurs.
+// - Les setups haussiers sont calculés en "miroir" (prix multipliés par -1),
+//   ce qui permet d'écrire la séquence une seule fois, côté vente.
+// Bits de `ev` : 1 zone H4 touchée · 2 sweep · 4 mss · 8 setup complet · 16 entrée
+//                32 TP1 · 64 TP2 · 128 SL · 256 annulé · 512 flip H4 · 1024 continuation H4
+// ═════════════════════════════════════════════════════════════════════════════
+
+f_hi(array<float> a, int from) =>
+    float m = na
+    int mi = na
+    int n = a.size()
+    int f = math.max(0, nz(from, 0))
+    if n > 0 and f <= n - 1
+        for i = f to n - 1
+            float v = a.get(i)
+            if na(m) or v > m
+                m := v
+                mi := i
+    [m, mi]
+
+f_lo(array<float> a, int from) =>
+    float m = na
+    int mi = na
+    int n = a.size()
+    int f = math.max(0, nz(from, 0))
+    if n > 0 and f <= n - 1
+        for i = f to n - 1
+            float v = a.get(i)
+            if na(m) or v < m
+                m := v
+                mi := i
+    [m, mi]
+
+fmes(simple string htf, int pH, int pL, float dispK, int wait1, int wait2, float lvl, float ext, float tolK, bool needOB, bool needFVG, string sess, string tz) =>
+    float tick = syminfo.mintick
+    float atr = ta.atr(14)
+    int htfMs = timeframe.in_seconds(htf) * 1000
+    bool newH = timeframe.change(htf)
+    bool inS = not na(time(timeframe.period, sess, tz))
+    float ph15 = ta.pivothigh(high, pL, pL)
+    float pl15 = ta.pivotlow(low, pL, pL)
+    int pivT = time[pL]
+
+    // ── Mémoire des bougies du graphique
+    var array<float> bh = array.new<float>()
+    var array<float> bl = array.new<float>()
+    var array<float> bo = array.new<float>()
+    var array<float> bc = array.new<float>()
+    var array<int> bt = array.new<int>()
+    bh.push(high)
+    bl.push(low)
+    bo.push(open)
+    bc.push(close)
+    bt.push(time)
+    if bh.size() > 600
+        bh.shift()
+        bl.shift()
+        bo.shift()
+        bc.shift()
+        bt.shift()
+    int nb = bh.size()
+
+    // ── Bougies du contexte (H4) reconstruites
+    var array<float> aH = array.new<float>()
+    var array<float> aL = array.new<float>()
+    var array<float> aC = array.new<float>()
+    var array<int> aT = array.new<int>()
+    var int nH = 0
+    var float cH = na
+    var float cL = na
+    var float cC = na
+    var int cT = na
+    bool hClosed = false
+    if newH
+        if not na(cH)
+            aH.push(cH)
+            aL.push(cL)
+            aC.push(cC)
+            aT.push(cT)
+            nH += 1
+            hClosed := true
+            if aH.size() > 400
+                aH.shift()
+                aL.shift()
+                aC.shift()
+                aT.shift()
+        cH := high
+        cL := low
+        cT := time
+    else
+        cH := na(cH) ? high : math.max(cH, high)
+        cL := na(cL) ? low : math.min(cL, low)
+        if na(cT)
+            cT := time
+    cC := close
+    int sz = aH.size()
+    int off = nH - sz
+
+    // ── État du contexte
+    var int trend = 0
+    var float r1 = na
+    var int r1T = na
+    var float r0 = na
+    var int r0T = na
+    var int r0g = na
+    var float p1 = na
+    var int p1T = na
+    var bool zoneNow = false
+    var bool everTouched = false
+    var bool freshFlip = false
+    var bool originProt = false
+    var int setupsDone = 0
+    var float brkLvl = na
+    var int brkT = na
+    var float lastPH = na
+    var int lastPHg = na
+    var float lastPL = na
+    var int lastPLg = na
+    var float aPL = na
+    var int aPLg = na
+    var float aPLprevPH = na
+    var bool plArmed = false
+    var float aPH = na
+    var int aPHg = na
+    var float aPHprevPL = na
+    var bool phArmed = false
+
+    // ── Liquidité du graphique (pivots non balayés)
+    var array<float> qH = array.new<float>()
+    var array<int> qHt = array.new<int>()
+    var array<float> qL = array.new<float>()
+    var array<int> qLt = array.new<int>()
+    var int lastHiSwT = na
+    var int lastLoSwT = na
+
+    // ── État de la séquence d'exécution (prix en miroir)
+    var int st = 0
+    var int model = 0
+    var int swBar = na
+    var float swLvl = na
+    var int swLvlT = na
+    var float sExt = na
+    var int sExtBar = na
+    var int sExtT = na
+    var float mssLvl = na
+    var int mssT0 = na
+    var int mssBar = na
+    var float f0 = na
+    var float eCur = na
+    var float obLo = na
+    var float obHi = na
+    var int obT = na
+    var float fvLo = na
+    var float fvHi = na
+    var int fvT = na
+    var array<float> gHi = array.new<float>()
+    var array<float> gLo = array.new<float>()
+    var array<int> gT = array.new<int>()
+    var int f0Bar = na
+    var array<float> hS = array.new<float>()
+    var array<float> hSL = array.new<float>()
+    var array<float> hT1 = array.new<float>()
+    var array<int> hM = array.new<int>()
+    var int gW = 0
+    var int gL = 0
+    var bool cDisp = false
+    var bool cOB = false
+    var bool cFV = false
+    var bool cAsia = false
+    var bool ready = false
+    var bool readySent = false
+    var bool m3Direct = false
+    var float eP = na
+    var float slP = na
+    var float t1P = na
+    var float t2P = na
+    var bool t1Hit = false
+    var float asH = na
+    var float asL = na
+    var bool wasS = false
+
+    int ev = 0
+    int cR = 0
+    int cM = 0
+    bool trendChanged = false
+
+    // ── Sweeps de liquidité (prix réels, deux côtés)
+    bool swHi = false
+    float swHiLvl = na
+    int swHiT = na
+    if qH.size() > 0
+        for i = qH.size() - 1 to 0
+            if high > qH.get(i)
+                if na(swHiLvl) or qH.get(i) > swHiLvl
+                    swHiLvl := qH.get(i)
+                    swHiT := qHt.get(i)
+                swHi := true
+                qH.remove(i)
+                qHt.remove(i)
+    bool swLo = false
+    float swLoLvl = na
+    int swLoT = na
+    if qL.size() > 0
+        for i = qL.size() - 1 to 0
+            if low < qL.get(i)
+                if na(swLoLvl) or qL.get(i) < swLoLvl
+                    swLoLvl := qL.get(i)
+                    swLoT := qLt.get(i)
+                swLo := true
+                qL.remove(i)
+                qLt.remove(i)
+    if swHi
+        lastHiSwT := time
+    if swLo
+        lastLoSwT := time
+    if not na(ph15)
+        qH.push(ph15)
+        qHt.push(pivT)
+        if qH.size() > 6
+            qH.shift()
+            qHt.shift()
+    if not na(pl15)
+        qL.push(pl15)
+        qLt.push(pivT)
+        if qL.size() > 6
+            qL.shift()
+            qLt.shift()
+
+    // ── Pivots du contexte
+    if hClosed and sz >= pH * 2 + 1
+        int ci = sz - 1 - pH
+        float ch = aH.get(ci)
+        float cl = aL.get(ci)
+        bool isPH = true
+        bool isPL = true
+        for i = ci - pH to ci + pH
+            if i != ci
+                if aH.get(i) > ch or (i < ci and aH.get(i) == ch)
+                    isPH := false
+                if aL.get(i) < cl or (i < ci and aL.get(i) == cl)
+                    isPL := false
+        if isPL
+            if trend == 0 or (trend == -1 and cl <= r0 + tick * 0.5)
+                aPL := cl
+                aPLg := off + ci
+                aPLprevPH := lastPH
+                plArmed := true
+            lastPL := cl
+            lastPLg := off + ci
+        if isPH
+            if trend == 0 or (trend == 1 and ch >= r0 - tick * 0.5)
+                aPH := ch
+                aPHg := off + ci
+                aPHprevPL := lastPL
+                phArmed := true
+            lastPH := ch
+            lastPHg := off + ci
+
+    // ── Cassures de structure du contexte
+    if hClosed and sz > 0
+        float c = aC.last()
+        if trend == -1 and not na(r1) and c > r1
+            // Flip haussier : le fib baissier est cassé
+            int g0 = na(lastPLg) ? r0g : math.max(lastPLg, r0g)
+            [lo, loI] = f_lo(aL, nz(g0, nH) - off)
+            brkLvl := r1
+            brkT := r1T
+            trend := 1
+            trendChanged := true
+            r1 := na(lo) ? r0 : lo
+            r1T := na(loI) ? r0T : aT.get(loI)
+            [hi, hiI] = f_hi(aH, nz(loI, sz - 1))
+            r0 := na(hi) ? aH.last() : hi
+            r0T := na(hiI) ? aT.last() : aT.get(hiI)
+            r0g := off + nz(hiI, sz - 1)
+            originProt := not na(lastLoSwT) and lastLoSwT >= r1T - htfMs and lastLoSwT <= r1T + htfMs
+            p1 := originProt ? r1 : na
+            p1T := r1T
+            ev += 512
+        else if trend == 1 and not na(r1) and c < r1
+            // Flip baissier : le fib haussier est cassé
+            int g0 = na(lastPHg) ? r0g : math.max(lastPHg, r0g)
+            [hi, hiI] = f_hi(aH, nz(g0, nH) - off)
+            brkLvl := r1
+            brkT := r1T
+            trend := -1
+            trendChanged := true
+            r1 := na(hi) ? r0 : hi
+            r1T := na(hiI) ? r0T : aT.get(hiI)
+            [lo, loI] = f_lo(aL, nz(hiI, sz - 1))
+            r0 := na(lo) ? aL.last() : lo
+            r0T := na(loI) ? aT.last() : aT.get(loI)
+            r0g := off + nz(loI, sz - 1)
+            originProt := not na(lastHiSwT) and lastHiSwT >= r1T - htfMs and lastHiSwT <= r1T + htfMs
+            p1 := originProt ? r1 : na
+            p1T := r1T
+            ev += 512
+        else if trend <= 0 and plArmed and c < aPL
+            // Cassure baissière (continuation ou première tendance)
+            [hi, hiI] = f_hi(aH, aPLg - off)
+            bool prot = not na(aPLprevPH) and not na(hi) and hi > aPLprevPH
+            brkLvl := aPL
+            brkT := aT.get(math.max(aPLg - off, 0))
+            if trend == 0
+                trendChanged := true
+            trend := -1
+            r1 := na(hi) ? aH.last() : hi
+            r1T := na(hiI) ? aT.last() : aT.get(hiI)
+            if prot
+                p1 := r1
+                p1T := r1T
+            else if not na(p1) and p1 <= r1
+                p1 := na
+            [lo, loI] = f_lo(aL, nz(hiI, sz - 1))
+            r0 := na(lo) ? aL.last() : lo
+            r0T := na(loI) ? aT.last() : aT.get(loI)
+            r0g := off + nz(loI, sz - 1)
+            zoneNow := false
+            freshFlip := false
+            ev += 1024
+        else if trend >= 0 and phArmed and c > aPH
+            // Cassure haussière (continuation ou première tendance)
+            [lo, loI] = f_lo(aL, aPHg - off)
+            bool prot = not na(aPHprevPL) and not na(lo) and lo < aPHprevPL
+            brkLvl := aPH
+            brkT := aT.get(math.max(aPHg - off, 0))
+            if trend == 0
+                trendChanged := true
+            trend := 1
+            r1 := na(lo) ? aL.last() : lo
+            r1T := na(loI) ? aT.last() : aT.get(loI)
+            if prot
+                p1 := r1
+                p1T := r1T
+            else if not na(p1) and p1 >= r1
+                p1 := na
+            [hi, hiI] = f_hi(aH, nz(loI, sz - 1))
+            r0 := na(hi) ? aH.last() : hi
+            r0T := na(hiI) ? aT.last() : aT.get(hiI)
+            r0g := off + nz(hiI, sz - 1)
+            zoneNow := false
+            freshFlip := false
+            ev += 1024
+        if ev >= 512
+            plArmed := false
+            phArmed := false
+        if trendChanged
+            zoneNow := false
+            everTouched := false
+            setupsDone := 0
+            freshFlip := ev >= 512 and ev < 1024
+            if not freshFlip
+                originProt := false
+
+    // ── Extrême courant (niveau 0) et contact du 0.71 du contexte
+    float z71r = na
+    float z71p = na
+    bool zoneHit = false
+    if trend == -1
+        if low < r0
+            r0 := low
+            r0T := time
+            r0g := nH
+            zoneNow := false
+        z71r := r0 + lvl * (r1 - r0)
+        z71p := not na(p1) and p1 > r1 ? r0 + lvl * (p1 - r0) : na
+        if not zoneNow and high >= z71r
+            zoneNow := true
+            everTouched := true
+            zoneHit := true
+            ev += 1
+    else if trend == 1
+        if high > r0
+            r0 := high
+            r0T := time
+            r0g := nH
+            zoneNow := false
+        z71r := r0 - lvl * (r0 - r1)
+        z71p := not na(p1) and p1 < r1 ? r0 - lvl * (r0 - p1) : na
+        if not zoneNow and low <= z71r
+            zoneNow := true
+            everTouched := true
+            zoneHit := true
+            ev += 1
+
+    // ── Séquence d'exécution, écrite côté vente (miroir pour les achats)
+    float s = trend == 1 ? -1.0 : 1.0
+    float H = s == 1 ? high : -low
+    float L = s == 1 ? low : -high
+    float O = s * open
+    float C = s * close
+    bool swNow = s == 1 ? swHi : swLo
+    float swL = s == 1 ? swHiLvl : -swLoLvl
+    int swLT = s == 1 ? swHiT : swLoT
+    float asT = s == 1 ? asH : -asL
+    bool ctx = trend != 0 and (zoneNow or everTouched)
+    bool skip = false
+
+    if trendChanged
+        if st > 0
+            ev += 256
+            cR := 3
+        st := 0
+        ready := false
+
+    // Modèle 3 : ordre limite direct sur le 0.71 de l'impulsion qui a cassé le range
+    if st == 0 and freshFlip and originProt and zoneHit and not trendChanged
+        model := 3
+        m3Direct := true
+        eP := s * z71r
+        slP := s * r1
+        t1P := s * r0
+        t2P := s * r0 - ext * (s * r1 - s * r0)
+        t1Hit := false
+        freshFlip := false
+        st := 3
+        ev += 16
+        skip := true
+
+    if not skip
+        if st == 0
+            if ctx and swNow and not trendChanged
+                st := 1
+                model := freshFlip ? 3 : zoneNow and setupsDone == 0 ? 1 : 2
+                m3Direct := false
+                swBar := bar_index
+                swLvl := swL
+                swLvlT := swLT
+                sExt := H
+                sExtBar := bar_index
+                sExtT := time
+                int i0 = nb - 1
+                while i0 > 0 and bt.get(i0) > swLT
+                    i0 -= 1
+                float m = na
+                int mi = i0
+                for i = i0 to nb - 1
+                    float v = s == 1 ? bl.get(i) : -bh.get(i)
+                    if na(m) or v < m
+                        m := v
+                        mi := i
+                mssLvl := m
+                mssT0 := bt.get(mi)
+                cDisp := O - C >= dispK * atr
+                cAsia := not inS and not na(asT) and H > asT
+                cOB := false
+                cFV := false
+                fvHi := na
+                fvLo := na
+                gHi.clear()
+                gLo.clear()
+                gT.clear()
+                obHi := na
+                obLo := na
+                ready := false
+                readySent := false
+                ev += 2
+        else if st == 1
+            if H > sExt
+                sExt := H
+                sExtBar := bar_index
+                sExtT := time
+                cDisp := false
+                fvHi := na
+                fvLo := na
+                gHi.clear()
+                gLo.clear()
+                gT.clear()
+            if O - C >= dispK * atr
+                cDisp := true
+            if not inS and not na(asT) and H > asT
+                cAsia := true
+            if C < mssLvl
+                st := 2
+                mssBar := bar_index
+                f0 := L
+                f0Bar := bar_index
+                int idx = nb - 1 - (bar_index - sExtBar)
+                if idx >= 0
+                    int kMin = math.max(0, idx - 10)
+                    int k = idx
+                    while k >= kMin and na(obHi)
+                        if s * bc.get(k) > s * bo.get(k)
+                            obHi := s == 1 ? bh.get(k) : -bl.get(k)
+                            obLo := s * bo.get(k)
+                            obT := bt.get(k)
+                        k -= 1
+                ev += 4
+            else if bar_index - swBar > wait1
+                st := 0
+                cR := 5
+                ev += 256
+        else if st == 2
+            if C > sExt
+                st := 0
+                cR := 2
+                ev += 256
+            else if bar_index > mssBar and H >= eCur
+                if ready
+                    eP := eCur
+                    slP := sExt
+                    t1P := f0 - ext * (sExt - f0)
+                    float h4t = s * r0
+                    t2P := h4t < t1P ? h4t : na
+                    t1Hit := false
+                    freshFlip := false
+                    st := 3
+                    ev += 16
+                    if H >= slP
+                        st := 0
+                        setupsDone += 1
+                        ev += 128
+                else
+                    st := 0
+                    cR := 4
+                    cM := (cDisp ? 0 : 1) + (cOB or not needOB ? 0 : 2) + (cFV or not needFVG ? 0 : 4)
+                    hS.push(s)
+                    hSL.push(sExt)
+                    hT1.push(f0 - ext * (sExt - f0))
+                    hM.push(cM)
+                    if hS.size() > 8
+                        hS.shift()
+                        hSL.shift()
+                        hT1.shift()
+                        hM.shift()
+                    ev += 256
+            else if bar_index - f0Bar > wait2
+                st := 0
+                cR := 1
+                ev += 256
+        else if st == 3
+            if H >= slP
+                st := 0
+                setupsDone += 1
+                ev += 128
+            else
+                if not t1Hit and L <= t1P
+                    t1Hit := true
+                    ev += 32
+                    if na(t2P)
+                        st := 0
+                        setupsDone += 1
+                if st == 3 and not na(t2P) and L <= t2P
+                    st := 0
+                    setupsDone += 1
+                    ev += 64
+
+    // Trades fantômes : setups refusés au 0.71 pour confluence incomplète, suivis jusqu'au TP1 ou au SL
+    int gEv = 0
+    int gMk = 0
+    float gY = na
+    if hS.size() > 0
+        for i = hS.size() - 1 to 0
+            float gs = hS.get(i)
+            float gHh = gs == 1 ? high : -low
+            float gLl = gs == 1 ? low : -high
+            int km = hM.get(i)
+            int unit = km == 1 ? 1 : km == 2 ? 1000 : km == 4 ? 1000000 : 1000000000
+            int res = gHh >= hSL.get(i) ? 2 : gLl <= hT1.get(i) ? 1 : 0
+            if res > 0
+                gEv := res
+                gMk := km
+                gY := gs * (res == 2 ? hSL.get(i) : hT1.get(i))
+                if res == 1
+                    gW += unit
+                else
+                    gL += unit
+                hS.remove(i)
+                hSL.remove(i)
+                hT1.remove(i)
+                hM.remove(i)
+
+    // Volume gaps formés depuis l'extrême du sweep
+    if (st == 1 or st == 2) and nb >= 3 and bar_index - 2 >= sExtBar
+        float l2 = s == 1 ? bl.get(nb - 3) : -bh.get(nb - 3)
+        if l2 > H
+            gHi.push(l2)
+            gLo.push(H)
+            gT.push(bt.get(nb - 2))
+            if gHi.size() > 12
+                gHi.shift()
+                gLo.shift()
+                gT.shift()
+
+    // Fib sur l'impulsion et confluence au 0.71 (tant que l'entrée n'est pas touchée)
+    if st == 2
+        if bar_index > mssBar and L < f0
+            f0 := L
+            f0Bar := bar_index
+        // b) le displacement compte aussi pendant l'impulsion, après le mss
+        if O - C >= dispK * atr
+            cDisp := true
+        eCur := f0 + lvl * (sExt - f0)
+        float tol = tolK * atr
+        // volume gap retenu : celui qui contient le 0.71, sinon le plus proche
+        fvHi := na
+        fvLo := na
+        float best = na
+        if gHi.size() > 0
+            for i = 0 to gHi.size() - 1
+                float gh = gHi.get(i)
+                float gl = gLo.get(i)
+                float d = eCur > gh ? eCur - gh : eCur < gl ? gl - eCur : 0.0
+                if na(best) or d < best
+                    best := d
+                    fvHi := gh
+                    fvLo := gl
+                    fvT := gT.get(i)
+        cOB := not na(obHi) and eCur <= obHi + tol and eCur >= obLo - tol
+        cFV := not na(fvHi) and eCur <= fvHi + tol and eCur >= fvLo - tol
+        bool allOk = cDisp and (cOB or not needOB) and (cFV or not needFVG)
+        if allOk and not readySent
+            readySent := true
+            ev += 8
+        ready := allOk
+
+    // Session Asie (plage de la dernière session terminée ou en cours)
+    if inS and not wasS
+        asH := high
+        asL := low
+    else if inS
+        asH := math.max(asH, high)
+        asL := math.min(asL, low)
+    wasS := inS
+
+    // Score : 7 conditions obligatoires + 1 bonus (sweep Asie)
+    bool seq = not m3Direct
+    int cnt = (trend != 0 ? 1 : 0) + (zoneNow or everTouched ? 1 : 0) + (seq and st >= 1 ? 1 : 0) + (seq and st >= 1 and cDisp ? 1 : 0) + (seq and st >= 2 ? 1 : 0) + (seq and st >= 2 and cOB ? 1 : 0) + (seq and st >= 2 and cFV ? 1 : 0) + (seq and st >= 1 and cAsia ? 1 : 0)
+    int score = math.round(cnt * 100.0 / 8.0)
+
+    [trend, r1, r1T, r0, r0T, p1, p1T, z71r, z71p, zoneNow, everTouched, model, st, score, ev, cDisp, cOB, cFV, cAsia, s * swLvl, swLvlT, s * sExt, sExtT, s * mssLvl, mssT0, s * f0, s * eCur, s * obLo, s * obHi, obT, s * fvLo, s * fvHi, fvT, s * eP, s * slP, s * t1P, s * t2P, brkLvl, brkT, m3Direct, ready, cR, cM, gEv, gMk, gY, gW, gL]
+// ═══ FIN DU MOTEUR ═══════════════════════════════════════════════════════════
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AFFICHAGE
+// ═════════════════════════════════════════════════════════════════════════════
+[trend, r1, r1T, r0, r0T, p1, p1T, z71r, z71p, zoneNow, everTouched, model, st, score, ev, cDisp, cOB, cFV, cAsia, swLvl, swLvlT, sExt, sExtT, mssLvl, mssT0, f0, eCur, obLo, obHi, obT, fvLo, fvHi, fvT, eP, slP, t1P, t2P, brkLvl, brkT, m3Direct, ready, cR, cM, gEv, gMk, gY, gW, gL] = fmes(i_htf, i_pH, i_pL, i_disp, i_wait1, i_wait2, i_lvl, i_ext, i_tol, i_needOB, i_needFVG, i_sess, i_tz)
+
+f_bit(int e, int k) =>
+    int(e / k) % 2 == 1
+
+bool eZone = f_bit(ev, 1)
+bool eSweep = f_bit(ev, 2)
+bool eMss = f_bit(ev, 4)
+bool eReady = f_bit(ev, 8)
+bool eEntry = f_bit(ev, 16)
+bool eTP1 = f_bit(ev, 32)
+bool eTP2 = f_bit(ev, 64)
+bool eSL = f_bit(ev, 128)
+bool eCancel = f_bit(ev, 256)
+bool eFlip = f_bit(ev, 512)
+bool eCont = f_bit(ev, 1024)
+
+string SZ = switch i_sizeS
+    "Très petit" => size.tiny
+    "Normal" => size.normal
+    => size.small
+int tfMs = timeframe.in_seconds() * 1000
+int tR = time + tfMs * i_extBars
+bool isSell = trend == -1
+color cMute = color.new(i_cTxt, 55)
+color cNone = color.new(color.black, 100)
+string lblAbove = label.style_label_down
+string lblBelow = label.style_label_up
+
+f_txt(int t, float y, string txt, color c, string sty) =>
+    label.new(t, y, txt, xloc = xloc.bar_time, style = sty, color = cNone, textcolor = c, size = SZ)
+
+f_lvl(line ln, label lb, int t1, float y, int t2, string txt, bool show) =>
+    float yy = show ? y : na
+    ln.set_xy1(t1, yy)
+    ln.set_xy2(t2, yy)
+    lb.set_xy(t2, yy)
+    lb.set_text(txt)
+
+f_miss(int m) =>
+    string a = int(m / 1) % 2 == 1 ? "displacement" : ""
+    string b = int(m / 2) % 2 == 1 ? "order block" : ""
+    string c = int(m / 4) % 2 == 1 ? "volume gap" : ""
+    string r = a
+    r := r + (r != "" and b != "" ? " + " : "") + b
+    r := r + (r != "" and c != "" ? " + " : "") + c
+    r
+
+f_reason(int code, int m) =>
+    switch code
+        1 => "Annulé : le prix n'est pas revenu au 0.71 dans le délai."
+        2 => "Annulé : clôture au-delà du niveau 1 avant l'entrée."
+        3 => "Annulé : la tendance H4 a changé pendant la séquence."
+        4 => "Annulé : retour au 0.71 avec confluence incomplète.\nManquant : " + f_miss(m) + ".\nSuivi en trade fantôme jusqu'au TP1 ou au SL."
+        => "Annulé."
+
+// ── Bougies
+barcolor(i_recolor ? (close >= open ? #E8A66B : #5F5E5A) : na)
+
+// ── Session Asie
+bool inS = not na(time(timeframe.period, i_sess, i_tz))
+var box asB = na
+if i_showAsia
+    if inS and not inS[1]
+        asB := box.new(time, high, time, low, xloc = xloc.bar_time, bgcolor = color.new(i_cAsia, 85), border_color = cNone, text = "Asia", text_color = i_cAsia, text_size = SZ, text_halign = text.align_left, text_valign = text.align_top)
+    else if inS and not na(asB)
+        asB.set_top(math.max(asB.get_top(), high))
+        asB.set_bottom(math.min(asB.get_bottom(), low))
+        asB.set_right(time)
+
+// ── Contexte H4 : cassures (historique)
+if i_showCtx and (eCont or eFlip) and not na(brkLvl)
+    line.new(brkT, brkLvl, time, brkLvl, xloc = xloc.bar_time, color = i_cTxt, width = 1)
+    f_txt(int(math.avg(brkT, time)), brkLvl, eFlip ? "range flip" : "continuation break", i_cTxt, isSell ? lblBelow : lblAbove)
+
+// ── Contexte H4 : niveaux courants
+var line lnR1 = line.new(na, na, na, na, xloc = xloc.bar_time, color = i_cLast, width = 1)
+var label lbR1 = label.new(na, na, "", xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = i_cLast, size = SZ)
+var line lnP1 = line.new(na, na, na, na, xloc = xloc.bar_time, color = i_cProt, width = 1)
+var label lbP1 = label.new(na, na, "", xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = i_cProt, size = SZ)
+var line lnZ1 = line.new(na, na, na, na, xloc = xloc.bar_time, color = i_cLast, width = 2, style = line.style_dashed)
+var label lbZ1 = label.new(na, na, "", xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = i_cLast, size = SZ)
+var line lnZ2 = line.new(na, na, na, na, xloc = xloc.bar_time, color = i_cProt, width = 2, style = line.style_dashed)
+var label lbZ2 = label.new(na, na, "", xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = i_cProt, size = SZ)
+var line lnR0 = line.new(na, na, na, na, xloc = xloc.bar_time, color = i_cTxt, width = 1)
+var label lbR0 = label.new(na, na, "", xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = i_cTxt, size = SZ)
+if barstate.islast
+    bool showC = i_showCtx and trend != 0
+    bool showP = showC and not na(p1) and p1 != r1
+    string lv = str.tostring(i_lvl)
+    f_lvl(lnR1, lbR1, r1T, r1, tR, isSell ? "last recent high" : "last recent low", showC)
+    f_lvl(lnZ1, lbZ1, r1T, z71r, tR, "H4 " + lv, showC)
+    f_lvl(lnR0, lbR0, r0T, r0, tR, "H4 0", showC)
+    f_lvl(lnP1, lbP1, p1T, p1, tR, isSell ? "protected high" : "protected low", showP)
+    f_lvl(lnZ2, lbZ2, p1T, z71p, tR, "H4 " + lv + " (protected)", showP)
+
+// ── Setup : objets du setup en cours
+var line sLn = na
+var label sLb = na
+var line mLn = na
+var label mLb = na
+var line f1Ln = na
+var line f7Ln = na
+var line f0Ln = na
+var line fTLn = na
+var label f1Lb = na
+var label f7Lb = na
+var label f0Lb = na
+var label fTLb = na
+var box obB = na
+var box fvB = na
+var box rkB = na
+var box rwB = na
+var label enLb = na
+var bool hasFib = false
+var bool provis = false
+
+if eCancel
+    if i_onlyCur
+        sLn.delete()
+        sLb.delete()
+        mLn.delete()
+        mLb.delete()
+        f1Ln.delete()
+        f7Ln.delete()
+        f0Ln.delete()
+        fTLn.delete()
+        f1Lb.delete()
+        f7Lb.delete()
+        f0Lb.delete()
+        fTLb.delete()
+        obB.delete()
+        fvB.delete()
+    else if provis
+        sLn.delete()
+        sLb.delete()
+    else
+        sLn.set_color(cMute)
+        sLb.set_textcolor(cMute)
+        mLn.set_color(cMute)
+        mLb.set_textcolor(cMute)
+        f1Ln.set_style(line.style_dotted)
+        f7Ln.set_style(line.style_dotted)
+        f0Ln.set_style(line.style_dotted)
+        fTLn.set_style(line.style_dotted)
+        f7Ln.set_color(cMute)
+        obB.set_bgcolor(color.new(i_cOB, 93))
+        fvB.set_bgcolor(color.new(i_cFVG, 95))
+        if hasFib
+            label cl = f_txt(time, cR == 3 ? close : sExt, "cancelled", color.new(#E24B4A, 0), isSell ? lblAbove : lblBelow)
+            cl.set_tooltip(f_reason(cR, cM))
+    hasFib := false
+    provis := false
+
+if eSweep
+    if i_onlyCur
+        sLn.delete()
+        sLb.delete()
+        mLn.delete()
+        mLb.delete()
+        f1Ln.delete()
+        f7Ln.delete()
+        f0Ln.delete()
+        fTLn.delete()
+        f1Lb.delete()
+        f7Lb.delete()
+        f0Lb.delete()
+        fTLb.delete()
+        obB.delete()
+        fvB.delete()
+        rkB.delete()
+        rwB.delete()
+        enLb.delete()
+    sLn := line.new(swLvlT, swLvl, time, swLvl, xloc = xloc.bar_time, color = cMute, width = 1, style = line.style_dashed)
+    sLb := f_txt(time, swLvl, "sweep ?", cMute, isSell ? lblAbove : lblBelow)
+    hasFib := false
+    provis := true
+
+if eMss
+    provis := false
+    sLn.set_color(i_cTxt)
+    sLn.set_style(line.style_solid)
+    sLb.set_text("sweep")
+    sLb.set_textcolor(i_cTxt)
+    mLn := line.new(mssT0, mssLvl, time, mssLvl, xloc = xloc.bar_time, color = i_cTxt, width = 1)
+    mLb := f_txt(int(math.avg(mssT0, time)), mssLvl, "mss", i_cTxt, isSell ? lblBelow : lblAbove)
+    f1Ln := line.new(sExtT, sExt, tR, sExt, xloc = xloc.bar_time, color = i_cTxt, width = 1)
+    f7Ln := line.new(sExtT, eCur, tR, eCur, xloc = xloc.bar_time, color = chart.fg_color, width = 1)
+    f0Ln := line.new(sExtT, f0, tR, f0, xloc = xloc.bar_time, color = i_cTxt, width = 1)
+    fTLn := line.new(sExtT, f0, tR, f0, xloc = xloc.bar_time, color = i_cTxt, width = 1, style = line.style_dashed)
+    f1Lb := label.new(tR, sExt, "1", xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = i_cTxt, size = SZ)
+    f7Lb := label.new(tR, eCur, str.tostring(i_lvl), xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = chart.fg_color, size = SZ)
+    f0Lb := label.new(tR, f0, "0", xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = i_cTxt, size = SZ)
+    fTLb := label.new(tR, f0, "-" + str.tostring(i_ext), xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = i_cTxt, size = SZ)
+    obB := na
+    fvB := na
+    if not na(obHi)
+        obB := box.new(obT, math.max(obLo, obHi), time, math.min(obLo, obHi), xloc = xloc.bar_time, bgcolor = color.new(i_cOB, 78), border_color = color.new(i_cOB, 40), text = "OB", text_color = i_cOB, text_size = SZ)
+    hasFib := true
+
+if st == 2 and hasFib
+    float tpx = f0 - i_ext * (sExt - f0)
+    f1Ln.set_x2(tR)
+    f7Ln.set_xy1(sExtT, eCur)
+    f7Ln.set_xy2(tR, eCur)
+    f0Ln.set_xy1(sExtT, f0)
+    f0Ln.set_xy2(tR, f0)
+    fTLn.set_xy1(sExtT, tpx)
+    fTLn.set_xy2(tR, tpx)
+    f1Lb.set_x(tR)
+    f7Lb.set_xy(tR, eCur)
+    f0Lb.set_xy(tR, f0)
+    fTLb.set_xy(tR, tpx)
+    obB.set_right(time)
+    if na(fvHi)
+        fvB.delete()
+        fvB := na
+    else if not na(fvB)
+        fvB.set_left(fvT)
+        fvB.set_top(math.max(fvLo, fvHi))
+        fvB.set_bottom(math.min(fvLo, fvHi))
+    else
+        fvB := box.new(fvT, math.max(fvLo, fvHi), time, math.min(fvLo, fvHi), xloc = xloc.bar_time, bgcolor = color.new(i_cFVG, 85), border_color = color.new(i_cFVG, 30), text = "volume gap", text_color = i_cFVG, text_size = SZ)
+    fvB.set_right(time)
+    f7Ln.set_width(ready ? 2 : 1)
+
+if eEntry
+    int tB = time + tfMs * i_boxBars
+    float tgt = na(t2P) ? t1P : t2P
+    rkB := box.new(time, math.max(eP, slP), tB, math.min(eP, slP), xloc = xloc.bar_time, bgcolor = color.new(#E24B4A, 80), border_color = cNone)
+    rwB := box.new(time, math.max(eP, tgt), tB, math.min(eP, tgt), xloc = xloc.bar_time, bgcolor = color.new(#888780, 80), border_color = cNone)
+    enLb := f_txt(time, eP, m3Direct ? "limit entry (range flip)" : "entry", chart.fg_color, isSell ? lblAbove : lblBelow)
+    if not na(t2P)
+        line.new(time, t1P, tB, t1P, xloc = xloc.bar_time, color = i_cTxt, width = 1, style = line.style_dashed)
+    hasFib := false
+var bool gotTP1 = false
+var bool trk = false
+var int nWin = 0
+var int nLoss = 0
+f_res(float y, string txt, color bg, bool above) =>
+    label.new(time, y, txt, xloc = xloc.bar_time, style = above ? label.style_label_down : label.style_label_up, color = bg, textcolor = color.white, size = SZ)
+if eEntry
+    gotTP1 := false
+    trk := not m3Direct
+if eTP1
+    gotTP1 := true
+    if trk
+        nWin += 1
+        trk := false
+    f_res(t1P, na(t2P) ? "WIN" : "WIN · TP1", #1D9E75, not isSell)
+if eTP2
+    f_res(t2P, "WIN · TP2", #1D9E75, not isSell)
+if eSL
+    f_res(slP, gotTP1 ? "SL after TP1" : "LOSS", gotTP1 ? #888780 : #E24B4A, isSell)
+    if trk
+        nLoss += 1
+        trk := false
+if i_showGhost and gEv > 0
+    bool gWin = gEv == 1
+    label gl = label.new(time, gY, gWin ? "ghost win" : "ghost loss", xloc = xloc.bar_time, style = label.style_label_left, color = cNone, textcolor = color.new(gWin ? #1D9E75 : #E24B4A, 25), size = SZ)
+    gl.set_tooltip("Trade fantôme (non pris).\nSetup refusé pour : " + f_miss(gMk) + ".\nS'il avait été pris : " + (gWin ? "TP1 atteint." : "SL touché."))
+
+// ── Dashboard
+string POS = switch i_posS
+    "Haut gauche" => position.top_left
+    "Bas droite" => position.bottom_right
+    "Bas gauche" => position.bottom_left
+    => position.top_right
+var table tb = table.new(POS, 2, 18, bgcolor = color.new(chart.bg_color, 10), border_color = color.new(i_cTxt, 70), border_width = 1, frame_color = color.new(i_cTxt, 50), frame_width = 1)
+
+f_row(int r, string name, bool ok, bool known) =>
+    color cG = #1D9E75
+    color cR = #E24B4A
+    tb.cell(0, r, name, text_color = chart.fg_color, text_halign = text.align_left, text_size = SZ)
+    tb.cell(1, r, known ? (ok ? "✔" : "✘") : "–", text_color = known ? (ok ? cG : cR) : i_cTxt, text_size = SZ)
+
+f_stat(int r, string name, int w, int l) =>
+    int n = w + l
+    float rw = (i_lvl + i_ext) / (1 - i_lvl)
+    float wr = n > 0 ? 1.0 * w / n : 0.0
+    float er = wr * rw - (1 - wr)
+    string v = n == 0 ? "–" : str.tostring(n) + " · " + str.tostring(math.round(wr * 100)) + " % · " + (er > 0 ? "+" : "") + str.tostring(er, "#.##") + "R"
+    tb.cell(0, r, name, text_color = chart.fg_color, text_halign = text.align_left, text_size = SZ)
+    tb.cell(1, r, v, text_color = n == 0 ? i_cTxt : er > 0 ? #1D9E75 : #E24B4A, text_size = SZ)
+
+if barstate.islast
+    bool seq = not m3Direct
+    bool touched = zoneNow or everTouched
+    color cS = score >= 88 ? #1D9E75 : score >= 50 ? #EF9F27 : i_cTxt
+    string risk = score >= 100 ? "1.5 %" : score >= 88 ? "1 %" : "0.5 %"
+    string status = switch
+        trend == 0 => "Pas de tendance H4"
+        st == 3 => "En position"
+        st == 2 and ready => "Setup complet · limite au " + str.tostring(i_lvl)
+        st == 2 => "Confluence incomplète"
+        st == 1 => "Sweep · attente du mss"
+        touched => "Zone H4 touchée · attente du sweep"
+        => "En veille · attente du " + str.tostring(i_lvl) + " H4"
+    tb.cell(0, 0, "FMES score", text_color = chart.fg_color, text_halign = text.align_left, text_size = SZ)
+    tb.cell(1, 0, str.tostring(score) + " %", text_color = cS, bgcolor = color.new(cS, 85), text_size = SZ)
+    f_row(1, "Tendance H4", trend != 0, true)
+    f_row(2, "H4 " + str.tostring(i_lvl) + " touché", touched, trend != 0)
+    f_row(3, "Sweep", seq and st >= 1, touched)
+    f_row(4, "Displacement", cDisp, seq and st >= 1)
+    f_row(5, "MSS", seq and st >= 2, seq and st >= 1)
+    f_row(6, "Order block", cOB, seq and st >= 2)
+    f_row(7, "Volume gap", cFV, seq and st >= 2)
+    f_row(8, "Sweep Asie (bonus)", cAsia, seq and st >= 1)
+    tb.cell(0, 9, trend == 0 ? "–" : "Modèle " + str.tostring(math.max(model, 1)) + (isSell ? " · Vente" : " · Achat"), text_color = chart.fg_color, text_halign = text.align_left, text_size = SZ)
+    tb.cell(1, 9, trend == 1 ? "▲" : trend == -1 ? "▼" : "–", text_color = trend == 1 ? #1D9E75 : trend == -1 ? #E24B4A : i_cTxt, text_size = SZ)
+    tb.cell(0, 10, "Risque suggéré", text_color = i_cTxt, text_halign = text.align_left, text_size = SZ)
+    tb.cell(1, 10, risk, text_color = chart.fg_color, text_size = SZ)
+    tb.cell(0, 11, status, text_color = chart.fg_color, text_halign = text.align_left, text_size = SZ)
+    tb.merge_cells(0, 11, 1, 11)
+    if i_showStats
+        tb.cell(0, 12, "Stats · trades · réussite TP1 · R moyen", text_color = i_cTxt, text_halign = text.align_left, text_size = SZ)
+        tb.merge_cells(0, 12, 1, 12)
+        f_stat(13, "Pris", nWin, nLoss)
+        f_stat(14, "Refusé : displacement", gW % 1000, gL % 1000)
+        f_stat(15, "Refusé : order block", int(gW / 1000) % 1000, int(gL / 1000) % 1000)
+        f_stat(16, "Refusé : volume gap", int(gW / 1000000) % 1000, int(gL / 1000000) % 1000)
+        f_stat(17, "Refusé : plusieurs", int(gW / 1000000000), int(gL / 1000000000))
+
+// ── Alertes (créer une alerte « Any alert() function call » sur l'indicateur)
+string side = isSell ? "sell" : "buy"
+string base = '{"system":"FMES","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","side":"' + side + '","model":' + str.tostring(math.max(model, 1)) + ',"score":' + str.tostring(score)
+f_p(float x) =>
+    str.tostring(x, format.mintick)
+if i_aZone and eZone
+    alert(base + ',"event":"h4_zone","level":' + f_p(z71r) + '}', alert.freq_once_per_bar_close)
+if i_aReady and eReady
+    alert(base + ',"event":"setup_ready","entry":' + f_p(eCur) + ',"sl":' + f_p(sExt) + ',"tp1":' + f_p(f0 - i_ext * (sExt - f0)) + ',"tp2":' + f_p(r0) + '}', alert.freq_once_per_bar_close)
+if i_aEntry and eEntry
+    alert(base + ',"event":"entry","entry":' + f_p(eP) + ',"sl":' + f_p(slP) + ',"tp1":' + f_p(t1P) + ',"tp2":' + (na(t2P) ? "null" : f_p(t2P)) + '}', alert.freq_once_per_bar_close)
+if i_aCancel and eCancel
+    alert(base + ',"event":"cancelled"}', alert.freq_once_per_bar_close)
